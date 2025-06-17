@@ -1,0 +1,13 @@
+{
+    "salmon_version": "1.10.3",
+    "index": "drerio_index",
+    "libType": "A",
+    "mates1": "../fastqs/SRR592702_1.fastq.gz",
+    "mates2": "../fastqs/SRR592702_2.fastq.gz",
+    "threads": "8",
+    "validateMappings": [],
+    "seqBias": [],
+    "gcBias": [],
+    "output": "../quants/SRR592702",
+    "auxDir": "aux_info"
+}

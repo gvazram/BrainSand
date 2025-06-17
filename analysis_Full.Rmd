@@ -1,0 +1,747 @@
+---
+title: "Brain Sand: Cross-Species Pineal Calcification"
+---
+
+
+```{r}
+
+########################################################################
+##  FULLY ROBUST IMPORT  →  ORTHOLOG MAP  →  COMBINED MATRIX         ##
+########################################################################
+
+samples <- data.frame(
+  accession = c("SRR5756462","SRR827499",
+                "SRR290898","SRR592702","SRR6116774","SRR24843922"),
+  species   = c("Human", "Rat", "Mouse", "Zebrafish", "Chicken", "Goat"),
+  stringsAsFactors = FALSE
+)
+samples$calcifies <- ifelse(samples$species %in% c("Human","Rat", "Goat"), "Yes","No")
+
+suppressPackageStartupMessages({
+  library(tximport);   library(biomaRt);     library(orthogene)
+  library(dplyr);      library(tibble)
+})
+
+## 0 ▸  build file vector -----------------------------------------------------
+files <- file.path("quants", samples$accession, "quant.sf")
+stopifnot(all(file.exists(files)))
+samples$sample_name <- paste0(samples$species, "_",
+                              ifelse(samples$calcifies=="Yes","calc","noncalc"))
+names(files) <- samples$sample_name
+species_files <- split(files, tolower(samples$species))
+
+## 1 ▸  gene‑level import with tx2gene ----------------------------------------
+ensembl_ds <- c(
+  human     = "hsapiens_gene_ensembl",
+  rat       = "rnorvegicus_gene_ensembl",
+  mouse     = "mmusculus_gene_ensembl",
+  zebrafish = "drerio_gene_ensembl",
+  chicken   = "ggallus_gene_ensembl",
+  goat      = "chircus_gene_ensembl"
+)
+
+get_tx2gene <- function(dataset){
+  mart <- tryCatch(
+    useEnsembl("genes", dataset=dataset, mirror="useast"),
+    error=function(e) useEnsembl("genes", dataset=dataset, mirror="www")
+  )
+  at <- if ("ensembl_transcript_id_version" %in% listAttributes(mart)$name)
+          "ensembl_transcript_id_version" else "ensembl_transcript_id"
+  tx2g <- getBM(attributes=c(at,"ensembl_gene_id"), mart=mart)
+  colnames(tx2g) <- c("TXNAME","GENEID")
+  tx2g$TXNAME <- sub("\\.[0-9]+$","",tx2g$TXNAME)
+  tx2g
+}
+
+counts_list <- list()
+for(sp in names(species_files)){
+  cat("→ importing", sp,"…\n")
+  txi <- tximport(species_files[[sp]],
+                  type="salmon",
+                  tx2gene=get_tx2gene(ensembl_ds[sp]),
+                  txOut=FALSE,          # GENE‑level!
+                  ignoreTxVersion=TRUE)
+  counts_list[[sp]] <- txi$counts
+  cat("   genes:", nrow(txi$counts)," | samples:", ncol(txi$counts),"\n")
+}
+
+## 2 ▸  ortholog map to human ENSG  ------------------------------------------
+mapped_list <- list(human = counts_list$human)   # human stays as‑is
+# ────────────────────────────────────────────────────────────────────────────
+# Convert all mapped_list components from ENSG → gene symbols, then re-merge
+# ────────────────────────────────────────────────────────────────────────────
+library(biomaRt)
+
+# 1) grab human ENSG → symbol mapping
+mart_hs <- useEnsembl("genes",
+                      dataset = "hsapiens_gene_ensembl",
+                      mirror  = "useast")
+hs_map  <- getBM(
+  attributes = c("ensembl_gene_id","external_gene_name"),
+  mart       = mart_hs
+)
+# drop blanks & duplicates
+hs_map <- hs_map[hs_map$external_gene_name != "" , ]
+hs_map <- hs_map[!duplicated(hs_map$ensembl_gene_id) &
+                 !duplicated(hs_map$external_gene_name), ]
+
+# 2) function to remap a matrix in mapped_list to gene symbols
+to_symbols <- function(mat){
+  # match ENSG rownames to hs_map
+  idx <- match(rownames(mat), hs_map$ensembl_gene_id)
+  keep <- which(!is.na(idx))
+  out  <- mat[keep, , drop = FALSE]
+  rownames(out) <- hs_map$external_gene_name[idx[keep]]
+  out
+}
+
+# 3) apply to every species in mapped_list
+for(sp in names(mapped_list)){
+  cat("→ remapping", sp, "to symbols…\n")
+  mapped_list[[sp]] <- to_symbols(mapped_list[[sp]])
+  cat("   now has", nrow(mapped_list[[sp]]), "genes (symbols)\n")
+}
+
+# 4) re-merge on gene symbols
+all_genes_sym <- sort(Reduce(union, lapply(mapped_list, rownames)))
+for(sp in names(mapped_list)){
+  miss <- setdiff(all_genes_sym, rownames(mapped_list[[sp]]))
+  if(length(miss)){
+    mapped_list[[sp]] <- rbind(
+      mapped_list[[sp]],
+      matrix(0, nrow=length(miss), ncol=ncol(mapped_list[[sp]]),
+             dimnames = list(miss, colnames(mapped_list[[sp]])))
+    )
+  }
+  mapped_list[[sp]] <- mapped_list[[sp]][all_genes_sym, , drop=FALSE]
+}
+
+combined <- do.call(cbind, mapped_list)
+cat("✓ re-combined matrix:", nrow(combined),
+    "genes (symbols) ×", ncol(combined), "samples\n")
+
+# 5) sanity check: human column should no longer be all zeros
+zero_counts_human <- all(combined[ , "Human_calc"] == 0)
+if(zero_counts_human) stop("❌ Human still all zeros—symbol mapping failed!")
+cat("✔ Human column contains non-zero values.\n")
+
+map_one <- function(mat, sp){
+  cat("   mapping", sp,"→ human … ")
+  res <- tryCatch(
+    orthogene::convert_orthologs(
+      gene_df          = mat,
+      gene_input       = "rownames",
+      input_species    = sp,
+      output_species   = "human",
+      non121_strategy  = "drop_both_species",
+      method           = "gprofiler"),
+    error=function(e){
+      cat("g:Profiler failed – fallback biomaRt\n")
+      mart_sp <- useEnsembl("genes", dataset=ensembl_ds[sp], mirror="www")
+      mart_hs <- useEnsembl("genes", dataset="hsapiens_gene_ensembl", mirror="www")
+      bm <- getLDS(
+        attributes   ="ensembl_gene_id",
+        filters      ="ensembl_gene_id",
+        values       = rownames(mat),
+        mart         = mart_sp,
+        attributesL  ="ensembl_gene_id",
+        martL        = mart_hs)
+      colnames(bm) <- c("orig","human")
+      bm <- bm[!duplicated(bm$orig)&!duplicated(bm$human),]
+      mat2 <- mat[match(bm$orig, rownames(mat)), ,drop=FALSE]
+      rownames(mat2) <- bm$human
+      mat2
+    })
+  if(is.list(res) && "gene_df" %in% names(res)) res <- res$gene_df
+  cat("mapped rows:", nrow(res),"\n")
+  res
+}
+
+for(sp in setdiff(names(counts_list),"human")){
+  mapped_list[[sp]] <- map_one(counts_list[[sp]], sp)
+}
+
+
+cat("✔ Human counts now use gene symbols:",
+    nrow(counts_list$human),"genes\n")
+
+## 3 ▸  merge matrices (fill 0) ----------------------------------------------
+all_genes <- sort(Reduce(union,lapply(mapped_list, rownames)))
+for(sp in names(mapped_list)){
+  miss <- setdiff(all_genes, rownames(mapped_list[[sp]]))
+  if(length(miss)){
+    mapped_list[[sp]] <- rbind(
+      mapped_list[[sp]],
+      matrix(0,length(miss),ncol(mapped_list[[sp]]),
+             dimnames=list(miss,colnames(mapped_list[[sp]]))))
+  }
+  mapped_list[[sp]] <- mapped_list[[sp]][all_genes,]
+}
+combined <- do.call(cbind, mapped_list)
+cat("✓ combined:", nrow(combined),"genes ×", ncol(combined),"samples\n")
+
+library(orthogene)
+
+# 1) prepare a named list of gene-level counts matrices
+#    (make sure rownames are ENSG or ENSMUSG… etc, and strip versions)
+expr_counts <- lapply(counts_list, function(mat){
+  rn <- sub("\\.[0-9]+$","", rownames(mat))
+  mat <- mat; rownames(mat) <- rn
+  mat
+})
+
+all_zero <- which(rowSums(combined == 0) == ncol(combined))
+length(all_zero)
+# e.g. "Dropping genes that are zero in every species."
+
+# keep only genes with at least one non-zero
+combined_filt <- combined[rowSums(combined) > 0, ]
+
+cat("✓ filtered combined: ", 
+    nrow(combined_filt), 
+    "genes ×", ncol(combined_filt), "samples\n")
+
+
+dim(combined) 
+dim(combined_filt)
+
+## quick peek
+head(combined)
+head(combined_filt)
+
+```
+
+
+
+```{r phylogeny, message=FALSE, warning=FALSE}
+library(dplyr)
+library(phylolm)
+library(ape)
+
+
+# 1) Read or define your tree (Newick format):
+tree <- read.tree(text = "(Danio_rerio:429.00000000,((Capra_hircus:94.00000000,((Rattus_norvegicus:11.64917000,Mus_musculus:11.64917000)'14':75.55083000,Homo_sapiens:87.20000000)'13':6.80000000)'25':224.95000000,Gallus_gallus:318.95000000)'37':110.05000000);")
+# 2) trait data keyed to tip labels, now with common names
+trait_df <- data.frame(
+  label       = c("Danio_rerio","Gallus_gallus","Mus_musculus",
+                  "Rattus_norvegicus","Capra_hircus","Homo_sapiens"),
+  common_name = c("Zebrafish",   "Chicken",    "Mouse",
+                  "Rat",  "Goat",       "Human"),
+  calcified   = c(0, 0, 0, 1, 1, 1),
+  stringsAsFactors = FALSE
+) %>%
+  # build a parse-able label: italicized scientific name + common name
+  mutate(
+    display_label = paste0(
+      "italic('", gsub("_", " ", label), "')",   # remove underscores + italic()
+      " ~ ' (' ~ '", common_name, "' ~ ')'"       # add common name in parens
+    )
+  )
+
+# 3) build the ggtree plot, using display_label
+p <- ggtree(tree) %<+% trait_df +
+  geom_tippoint(aes(color = factor(calcified)), size = 3) +
+  geom_tiplab(
+    aes(label = display_label),
+    parse     = TRUE,    # interpret display_label as an expression
+    align     = TRUE,
+    linetype  = NA,
+    size      = 4,
+    offset    = 0.2
+  ) +
+  scale_color_manual(
+    name   = "Calcifies",
+    values = c("0" = "#377EB8", "1" = "#E41A1C"),
+    labels = c("non-calcified", "calcified")
+  ) +
+  theme_tree2() +
+  coord_cartesian(clip = "off") +
+  theme(
+    plot.margin        = margin(t = 5, r = 150, b = 5, l = 5, unit = "pt"),
+    legend.position    = c(0, 0.95),
+    legend.justification = c("left", "top"),
+    legend.background  = element_rect(fill = alpha("white", 0.8), color = NA)
+  ) +
+  labs(
+    x       = "Divergence time (million years)",
+    title   = "Phylogeny of Sample Species",
+    caption = "Divergence times from TimeTree 5"
+  )
+
+# display it
+print(p)
+
+# 4) save as PNG at high resolution
+ggsave(
+  "Figure1_phylogeny.png", p,
+  width  = 8,    # inches
+  height = 4,    # inches
+  dpi    = 300,  # dots per inch
+  units  = "in"
+)
+```
+
+
+```{r pca_by_calcification, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)    # for repel text
+
+# 1) compute log2(TPM + 1)
+logTPM <- log2(combined_filt + 1)
+
+# 2) transpose so samples are rows, genes are columns
+dat <- t(logTPM)
+
+# 3) run PCA (center & scale = TRUE)
+pca <- prcomp(dat, center = TRUE, scale. = TRUE)
+
+# 4) extract the scores (PC1, PC2) into a data.frame
+scores <- as.data.frame(pca$x[, 1:2])
+scores$sample <- rownames(scores)
+
+# 5) annotate calcification status
+scores$calcifies <- ifelse(
+  scores$sample %in% c("human", "rat", "goat"),
+  "calcified", "non-calcified"
+)
+
+# 5b) map to scientific + common names, build parseable label
+species_map <- data.frame(
+  sample      = c("zebrafish", "chicken", "mouse",
+                  "rat",        "goat",    "human"),
+  scientific  = c("Danio_rerio", "Gallus_gallus", "Mus_musculus",
+                  "Rattus_norvegicus", "Capra_hircus", "Homo_sapiens"),
+  common_name = c("Zebrafish",   "Chicken",        "Mouse",
+                  "Rat",         "Goat",           "Human"),
+  stringsAsFactors = FALSE
+)
+
+scores <- scores %>%
+  left_join(species_map, by = "sample") %>%
+  mutate(
+    display_label = paste0(
+      "italic('", gsub("_", " ", scientific), "')",
+      " ~ ' (' ~ '", common_name, "' ~ ')'"
+    )
+  )
+
+p2 <- ggplot(scores, aes(PC1, PC2, color = calcifies)) +
+  geom_point(size = 4) +
+  geom_text_repel(
+    aes(label = display_label),
+    parse         = TRUE,
+    size          = 3,
+    box.padding   = 0.3,
+    point.padding = 0.2,
+    segment.size  = 0.5
+  ) +
+  scale_color_manual(
+    values = c(
+      "non-calcified" = "#377EB8",
+      "calcified"     = "#E41A1C"
+    ),
+    name  = "Calcifies",
+    guide = guide_legend(
+      title.position = "top",
+      title.hjust    = 0.5
+    )
+  ) +
+  scale_x_continuous(
+    breaks = pretty_breaks(n = 5),
+    labels = label_number(accuracy = 1)
+  ) +
+  scale_y_continuous(
+    breaks = pretty_breaks(n = 5),
+    labels = label_number(accuracy = 1)
+  ) +
+  labs(
+    title = "PCA of Sample Species",
+    x     = sprintf("PC1 (%.1f%% variance)",
+                    100 * summary(pca)$importance[2, 1]),
+    y     = sprintf("PC2 (%.1f%% variance)",
+                    100 * summary(pca)$importance[2, 2])
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_minimal() +
+  theme(
+    # force white under the points & behind the whole plot
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background  = element_rect(fill = "white", colour = NA),
+    plot.margin      = margin(t = 10, r = 80, b = 10, l = 10, unit = "pt"),
+    legend.position     = c(1.17, 0.8),
+    legend.justification = c(1, 1),
+    legend.title.align   = 0.5,
+    legend.margin        = margin(5, 5, 5, 5)
+  )
+
+# display it
+print(p2)
+
+
+write.table(
+  scores %>%
+    dplyr::select(common_name, scientific, PC1, PC2),
+  row.names = FALSE,
+  sep = ","
+)
+
+# 7) save Figure2 as a high-res PNG with white bg
+ggsave("Figure2_PCA.png", p2,
+       width  = 8,    # inches
+       height = 4,    # inches
+       dpi    = 300,  # dpi
+       units  = "in",
+       bg     = "white")
+
+```
+
+
+```{r model_fit, message=FALSE, warning=FALSE}
+sample_names <- colnames(combined_filt)
+#> [1] "human"     "chicken"   "goat"      "mouse"     "rat"       "zebrafish"
+
+# 2) define the mapping *from* those lower‐case names *to* the Latin tip labels
+sp_map <- c(
+  human     = "Homo_sapiens",
+  chicken   = "Gallus_gallus",
+  goat      = "Capra_hircus",
+  mouse     = "Mus_musculus",
+  rat       = "Rattus_norvegicus",
+  zebrafish = "Danio_rerio"
+)
+
+# 3) log2‐transform & transpose
+expr_mat <- t(log2(combined_filt + 1))
+
+# 4) assign the correct Latin names
+rownames(expr_mat) <- sp_map[sample_names]
+
+print(rownames(expr_mat))
+#> [1] "Homo_sapiens"      "Gallus_gallus"     "Capra_hircus"     
+#>     "Mus_musculus"      "Rattus_norvegicus" "Danio_rerio"
+
+# 5) reorder rows to exactly match your tree’s tip.labels
+expr_mat <- expr_mat[tree$tip.label, , drop = FALSE]
+
+# 6) sanity‐check
+if (!all(rownames(expr_mat) == tree$tip.label)) {
+  stop("rownames(expr_mat) do not match tree$tip.label!")
+}
+
+#  → Make sure trait_df also uses the SAME Latin tip labels:
+trait_df <- data.frame(
+  species   = c("Danio_rerio", "Gallus_gallus", "Mus_musculus",
+                "Rattus_norvegicus", "Capra_hircus", "Homo_sapiens"),
+  calcified = c(0, 0, 0, 1, 1, 1)
+)
+rownames(trait_df) <- trait_df$species
+library(phylolm)
+library(dplyr)
+
+# Loop through all genes
+results_all <- lapply(colnames(expr_mat), function(gene_name) {
+  df <- data.frame(
+    species    = rownames(expr_mat),
+    expression = expr_mat[, gene_name],
+    calcified  = trait_df[rownames(expr_mat), "calcified"]
+  )
+  rownames(df) <- df$species
+
+  # PGLS BM
+  fit_bm <- tryCatch(
+    phylolm(expression ~ calcified, data = df, phy = tree, model = "BM"),
+    error = function(e) NULL
+  )
+  bm_coef <- if (!is.null(fit_bm)) summary(fit_bm)$coefficients else NA
+  bm_logFC <- if (!is.null(fit_bm)) bm_coef["calcified", "Estimate"] else NA
+  bm_P <- if (!is.null(fit_bm)) bm_coef["calcified", "p.value"] else NA
+
+  # PGLS lambda
+  fit_lambda <- tryCatch(
+    phylolm(expression ~ calcified, data = df, phy = tree, model = "lambda"),
+    error = function(e) NULL
+  )
+  lambda_coef <- if (!is.null(fit_lambda)) summary(fit_lambda)$coefficients else NA
+  lambda_logFC <- if (!is.null(fit_lambda)) lambda_coef["calcified", "Estimate"] else NA
+  lambda_P <- if (!is.null(fit_lambda)) lambda_coef["calcified", "p.value"] else NA
+  lambda_val <- if (!is.null(fit_lambda)) fit_lambda$optpar else NA
+
+  # Return data.frame row for this gene
+  data.frame(
+    gene = gene_name,
+    logFC_bm = bm_logFC,
+    P_bm = bm_P,
+    logFC_lambda = lambda_logFC,
+    P_lambda = lambda_P,
+    lambda = lambda_val,
+    stringsAsFactors = FALSE
+  )
+})
+
+# Combine all genes into a data.frame
+pgls_results <- bind_rows(results_all)
+
+# Adjust p-values with Benjamini-Hochberg for each test
+pgls_results$adj.P_bm     <- p.adjust(pgls_results$P_bm,     method = "BH")
+pgls_results$adj.P_lambda <- p.adjust(pgls_results$P_lambda, method = "BH")
+```
+
+
+```{r volcano_plot, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(grid)
+
+# 1) Prep your volcano data
+volc_df <- pgls_results %>%
+  filter(
+    !is.na(logFC_lambda),
+    !is.na(P_lambda),
+    lambda < 0.7
+  ) %>%
+  mutate(
+    negLog10AdjP = -log10(adj.P_lambda),
+    sig_logical  = adj.P_lambda < 0.05 & abs(logFC_lambda) > 1
+  )
+
+# 2) Pick top 10 for labeling using the logical column
+top_hits <- volc_df %>%
+  filter(sig_logical) %>%
+  arrange(adj.P_lambda) %>%
+  slice_head(n = 10)
+
+# 3) Now make 'significant' a factor to control legend order
+volc_df <- volc_df %>%
+  mutate(
+    significant = factor(sig_logical, levels = c(TRUE, FALSE))
+  )
+
+# 4) Build the volcano plot
+volcano_plot <- ggplot(volc_df, aes(x = logFC_lambda, y = negLog10AdjP)) +
+  geom_point(aes(color = significant), size = 2, alpha = 0.7) +
+  geom_text_repel(
+    data               = top_hits,
+    aes(label          = gene),
+    size               = 3,
+    box.padding        = 1,              # more space around text
+    point.padding      = 0,              # more space from the point
+    force              = 1.5,              # stronger repulsion
+    min.segment.length = 0,
+    segment.size       = 0.5,
+    segment.color      = "black",
+    segment.curvature  = 0,
+    arrow              = arrow(
+                           length = unit(0.02, "inches"),
+                           type   = "closed"
+                         ),
+    max.overlaps       = Inf
+  ) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  scale_color_manual(
+    name   = "Significant",
+    breaks = c("TRUE", "FALSE"),
+    labels = c("True",  "False"),
+    values = c("TRUE"  = "firebrick", "FALSE" = "gray70")
+  ) +
+  theme_light(base_size = 14) +
+  labs(
+    title = "Volcano Plot of Significant Gene Expression Changes",
+    x     = expression(log[2]~Fold~Change~(λ~model)),
+    y     = expression(-log[10]~Adjusted~P~(λ~model))
+  ) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right",
+    legend.title    = element_text(face = "bold"),
+    legend.text     = element_text(size = 11)
+  )
+
+ggsave(
+  filename = "Figure4_volcano.png",
+  plot     = volcano_plot,
+  width    = 10,
+  height   = 10,
+  dpi      = 300
+)
+
+volcano_plot
+```
+
+
+```{r top10_genes, message=FALSE, warning=FALSE}
+library(dplyr)
+library(gridExtra)
+library(ggplot2)
+# Filter for significance in both models (adj.P < 0.05) and |logFC| > 1 (for both)
+pgls_results_sig <- pgls_results %>%
+  filter(
+    !is.na(adj.P_bm) & !is.na(adj.P_lambda),
+    adj.P_bm     < 0.05,
+    adj.P_lambda < 0.05,
+    abs(logFC_bm)     > 1,
+    abs(logFC_lambda) > 1,
+    lambda < 0.7
+  ) %>%
+  arrange(P_lambda)
+
+combined_filt_df <- as.data.frame(combined_filt)
+combined_filt_df$gene <- rownames(combined_filt_df)
+
+expr_and_pgls <- combined_filt_df %>%
+  inner_join(pgls_results_sig, by = "gene")
+calcify_order <- c("human", "rat", "goat", "mouse", "chicken", "zebrafish")
+
+# 2. Identify the other (statistical) columns:
+stat_cols <- setdiff(colnames(expr_and_pgls), c("gene", calcify_order))
+
+# 3. Reorder columns:
+library(dplyr)
+expr_and_pgls <- expr_and_pgls %>%
+  dplyr::select(gene, all_of(calcify_order), all_of(stat_cols))
+
+# If you want the top 10:
+top_pgls <- pgls_results_sig %>%
+  slice_head(n = 10)
+
+# 1) Get your top 10, already sorted by adj.P_lambda
+top10 <- pgls_results_sig %>%
+  arrange(adj.P_lambda) %>%
+  slice_head(n = 10)
+
+colnames(top10) <- c("Gene Symbol",
+                     "Log2 Fold Change (BM model)",
+                     "P-value (BM model)",
+                     "Log2 Fold Change (Lambda model)",
+                     "P-value (Lambda model)",
+                     "Pagel's λ",
+                     "Adjusted P-value (BM model)",
+                     "Adjusted P-value (Lambda model)")
+
+
+# 2) Turn it into a table grob
+tbl_grob <- tableGrob(top10, rows = NULL)  # rows=NULL removes the row names column
+
+print(top10)
+# 3) Save it as a PNG
+ggsave(
+  filename = "Figure5_top10genes.png",
+  plot     = tbl_grob,
+  width    = 18,    # inches
+  height   = 4,    # inches
+  dpi      = 300,  # good print quality
+  units    = "in"
+)
+```
+
+
+
+```{r heatmap, message=FALSE, warning=FALSE}
+
+library(tibble)   # for column_to_rownames()
+library(pheatmap)
+
+# 1) Define your desired sample order (calcifiers left → non right)
+calcify_order <- c("human","rat","goat","mouse","chicken","zebrafish")
+
+# 2) Build the raw heat matrix from your joined data.frame 
+#    using base‐R subsetting instead of dplyr::select():
+heat_mat <- expr_and_pgls %>%
+  column_to_rownames("gene") %>%
+  as.data.frame()  # ensure it's a plain data.frame
+
+# now subset those six columns in order:
+heat_mat <- as.matrix(heat_mat[, calcify_order])
+
+# 3) Get your significance‐sorted gene order
+sig_order <- pgls_results_sig %>%
+  arrange(adj.P_lambda) %>%
+  pull(gene)
+
+# 4) Reorder rows of heat_mat
+heat_mat_ordered <- heat_mat[sig_order, , drop = FALSE]
+
+annotation_col <- data.frame(
+  Calcifies = factor(
+    ifelse(colnames(heat_mat_ordered) %in% c("human","rat","goat"),
+           "yes","no"),
+    levels = c("yes","no")
+  )
+)
+rownames(annotation_col) <- colnames(heat_mat_ordered)
+
+# 5b) define the discrete‐annotation colours
+ann_colors <- list(
+  Calcifies = c(
+    yes = "#E41A1C",   # red for calcified
+    no  = "#377EB8"    # blue for non‐calcified
+  )
+)
+
+# 5c) define a matching blue–white–red palette for the heatmap cells
+heat_colors <- colorRampPalette(c("#377EB8","white","#E41A1C"))(100)
+library(ComplexHeatmap)
+# open a 8×10 in PNG at 300 dpi
+
+
+png(
+  filename = "Figure3_heatmap.png",
+  width    = 8*300,
+  height   = 10*300,
+  res      = 300
+)
+pheatmap(
+  heat_mat_ordered,
+  annotation_col    = annotation_col,
+  annotation_colors = ann_colors,
+  color             = heat_colors,
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  scale             = "row",
+  show_rownames     = TRUE,
+  fontsize_col      = 10,
+  fontsize_row      = 4,
+  legend_breaks     = c(-2, 0, 2),
+  legend_labels     = c("Low", "Medium", "High"),
+  main              = "Significant Genes Heatmap",
+  name              = "Expression"
+)
+dev.off()
+pheatmap(
+  heat_mat_ordered,
+  annotation_col    = annotation_col,
+  annotation_colors = ann_colors,
+  color             = heat_colors,
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  scale             = "row",
+  show_rownames     = TRUE,
+  fontsize_col      = 10,
+  fontsize_row      = 4,
+  legend_breaks     = c(-2, 0, 2),
+  legend_labels     = c("Low", "Medium", "High"),
+  main              = "Significant Genes Heatmap",
+  name              = "Expression"
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

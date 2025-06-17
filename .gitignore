@@ -1,0 +1,13 @@
+# raw data – belongs in SRA/GEO, not GitHub
+fastqs/
+sras/
+
+# Salmon auxiliary output we can rebuild any time
+quants/**/aux_info/
+quants/**/logs/
+
+# temporary or IDE files
+scratch/
+*.Rproj.user/
+.Rhistory
+.RData

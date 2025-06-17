@@ -1,0 +1,13 @@
+{
+    "salmon_version": "1.10.3",
+    "index": "oaries_index",
+    "libType": "A",
+    "mates1": "../fastqs/SRR19415620_1.fastq.gz",
+    "mates2": "../fastqs/SRR19415620_2.fastq.gz",
+    "threads": "8",
+    "validateMappings": [],
+    "seqBias": [],
+    "gcBias": [],
+    "output": "../quants/SRR19415620",
+    "auxDir": "aux_info"
+}
