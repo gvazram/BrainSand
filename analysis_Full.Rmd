@@ -122,7 +122,7 @@ cat("✓ re-combined matrix:", nrow(combined),
 
 # 5) sanity check: human column should no longer be all zeros
 zero_counts_human <- all(combined[ , "Human_calc"] == 0)
-if(zero_counts_human) stop("❌ Human still all zeros—symbol mapping failed!")
+if(zero_counts_human) stop("Human still all zeros—symbol mapping failed!")
 cat("✔ Human column contains non-zero values.\n")
 
 map_one <- function(mat, sp){
@@ -219,7 +219,7 @@ library(phylolm)
 library(ape)
 
 
-# 1) Read or define your tree (Newick format):
+# 1) Read or define tree (Newick format):
 tree <- read.tree(text = "(Danio_rerio:429.00000000,((Capra_hircus:94.00000000,((Rattus_norvegicus:11.64917000,Mus_musculus:11.64917000)'14':75.55083000,Homo_sapiens:87.20000000)'13':6.80000000)'25':224.95000000,Gallus_gallus:318.95000000)'37':110.05000000);")
 # 2) trait data keyed to tip labels, now with common names
 trait_df <- data.frame(
@@ -643,11 +643,10 @@ ggsave(
 library(tibble)   # for column_to_rownames()
 library(pheatmap)
 
-# 1) Define your desired sample order (calcifiers left → non right)
+# 1) Define desired sample order (calcifiers left → non right)
 calcify_order <- c("human","rat","goat","mouse","chicken","zebrafish")
 
-# 2) Build the raw heat matrix from your joined data.frame 
-#    using base‐R subsetting instead of dplyr::select():
+# 2) Build the raw heat matrix
 heat_mat <- expr_and_pgls %>%
   column_to_rownames("gene") %>%
   as.data.frame()  # ensure it's a plain data.frame
@@ -655,7 +654,7 @@ heat_mat <- expr_and_pgls %>%
 # now subset those six columns in order:
 heat_mat <- as.matrix(heat_mat[, calcify_order])
 
-# 3) Get your significance‐sorted gene order
+# 3) Get significance‐sorted gene order
 sig_order <- pgls_results_sig %>%
   arrange(adj.P_lambda) %>%
   pull(gene)
@@ -726,22 +725,6 @@ pheatmap(
   name              = "Expression"
 )
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
